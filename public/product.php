@@ -8,25 +8,58 @@ $p = mysqli_fetch_assoc($q);
 if(!$p){ header('Location: index.php'); exit; }
 ?>
 <!DOCTYPE html>
-<html>
+<html lang="id">
 <head>
-<title><?= htmlspecialchars($p['nama_produk']); ?> - Toko Aksesoris Mobil</title>
-<link rel="stylesheet" href="/aksesoris_mobil/assets/css/style.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><?= htmlspecialchars($p['nama_produk']); ?> - Toko Aksesoris Mobil</title>
+  <link rel="stylesheet" href="/aksesoris_mobil/assets/css/style.css">
 </head>
 <body>
 <?php include '../includes/header.php'; ?>
+
+<!-- Page Header -->
+<section class="hero" style="padding: 30px 20px;">
+  <div class="container">
+    <h2><?= htmlspecialchars($p['nama_produk']); ?></h2>
+    <p>Detail produk lengkap</p>
+  </div>
+</section>
+
 <div class="container">
   <div class="product-detail">
-    <img src="/aksesoris_mobil/assets/img/<?= $p['gambar']; ?>" alt="<?= htmlspecialchars($p['nama_produk']); ?>">
-    <div>
+    <div class="product-detail-image">
+      <img src="/aksesoris_mobil/assets/img/<?= $p['gambar']; ?>" alt="<?= htmlspecialchars($p['nama_produk']); ?>">
+    </div>
+    <div class="product-detail-info">
       <h2><?= $p['nama_produk']; ?></h2>
-      <p><?= nl2br(htmlspecialchars($p['deskripsi'])); ?></p>
-      <p><strong>Harga:</strong> Rp <?= number_format($p['harga']); ?></p>
-      <p><strong>Stok:</strong> <?= intval($p['stok']); ?></p>
-      <p><a href="/aksesoris_mobil/public">&laquo; Kembali ke daftar produk</a></p>
+      <div class="product-detail-price">Rp <?= number_format($p['harga']); ?></div>
+      
+      <div class="product-meta">
+        <div class="product-meta-item">
+          <span class="product-meta-label">Stok Tersedia</span>
+          <span class="product-meta-value"><?= intval($p['stok']); ?> unit</span>
+        </div>
+        <div class="product-meta-item">
+          <span class="product-meta-label">Kategori</span>
+          <span class="product-meta-value"><?= htmlspecialchars($p['kategori_id'] ?? 'Umum'); ?></span>
+        </div>
+      </div>
+      
+      <div class="product-detail-description">
+        <h4 style="margin-bottom: 12px;">Deskripsi Produk</h4>
+        <p><?= nl2br(htmlspecialchars($p['deskripsi'])); ?></p>
+      </div>
+      
+      <div class="card-actions" style="margin-top: 24px;">
+        <a href="/aksesoris_mobil/public" class="btn btn-secondary">&laquo; Kembali</a>
+        <button class="btn btn-primary" onclick="alert('Fitur keranjang belanja akan segera hadir!')">Tambah ke Keranjang</button>
+      </div>
     </div>
   </div>
 </div>
+
 <?php include '../includes/footer.php'; ?>
 </body>
 </html>
+

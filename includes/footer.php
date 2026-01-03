@@ -1,7 +1,15 @@
 <?php
 ?>
-<footer style="background:#f5f5f5;padding:18px 0;margin-top:40px">
-  <div class="container">
-    <small class="text-muted">&copy; <?= date('Y'); ?> Toko Aksesoris Mobil - All rights reserved.</small>
+<footer class="site-footer">
+  <div class="footer-inner container">
+    <div class="footer-text">
+      &copy; <?= date('Y'); ?> Toko Aksesoris Mobil - All rights reserved.
+    </div>
+    <div class="footer-social">
+      <a href="#" title="Facebook">FB</a>
+      <a href="#" title="Instagram">IG</a>
+      <a href="#" title="WhatsApp">WA</a>
+    </div>
   </div>
 </footer>
+
