@@ -1,0 +1,684 @@
+<parameter name="content"><?php
+/**
+ * Enhanced Chatbot API Handler
+ * AI-powered customer service chatbot for LuxeAuto Parts
+ * Production-ready with product cards, escalation detection, and rich responses
+ */
+
+error_reporting(0);
+ini_set('display_errors', 0);
+
+while (ob_get_level()) ob_end_clean();
+
+header('Content-Type: application/json');
+header('Cache-Control: no-store, no-cache, must-revalidate');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type');
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit;
+}
+
+session_start();
+include_once 'config.php';
+
+$input = json_decode(file_get_contents('php://input'), true);
+$message = isset($input['message']) ? trim($input['message']) : '';
+$action = isset($input['action']) ? $input['action'] : 'chat';
+$replyAction = isset($input['reply_action']) ? $input['reply_action'] : '';
+
+// Initialize session for conversation tracking
+if (!isset($_SESSION['chatbot_context'])) {
+    $_SESSION['chatbot_context'] = [
+        'failed_attempts' => 0,
+        'last_topic' => '',
+        'escalation_offered' => false,
+        'conversation_count' => 0
+    ];
+}
+
+$_SESSION['chatbot_context']['conversation_count']++;
+
+$response = [
+    'success' => true,
+    'reply' => '',
+    'quick_replies' => [],
+    'product' => null,
+    'product_card' => null,
+    'escalate' => false
+];
+
+// Helper Functions
+function getCartCount() {
+    return isset($_SESSION['cart']) ? array_sum($_SESSION['cart']) : 0;
+}
+
+function getCartTotal() {
+    global $pdo;
+    if (!isset($_SESSION['cart']) || empty($_SESSION['cart'])) {
+        return 0;
+    }
+    $ids = array_keys($_SESSION['cart']);
+    if (empty($ids)) return 0;
+    
+    $placeholders = str_repeat('?,', count($ids) - 1) . '?';
+    $stmt = $pdo->prepare("SELECT id, price FROM products WHERE id IN ($placeholders)");
+    $stmt->execute($ids);
+    $products = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+    
+    $total = 0;
+    foreach ($_SESSION['cart'] as $id => $qty) {
+        if (isset($products[$id])) {
+            $total += $products[$id] * $qty;
+        }
+    }
+    return $total;
+}
+
+function searchProducts($query, $limit = 5) {
+    global $pdo;
+    $stmt = $pdo->prepare("SELECT id, name, description, price, stock, image FROM products WHERE name LIKE ? OR description LIKE ? ORDER BY name LIMIT ?");
+    $stmt->execute(['%' . $query . '%', '%' . $query . '%', $limit]);
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+function getProduct($id) {
+    global $pdo;
+    $stmt = $pdo->prepare("SELECT id, name, description, price, stock, image, category FROM products WHERE id = ?");
+    $stmt->execute([$id]);
+    return $stmt->fetch(PDO::FETCH_ASSOC);
+}
+
+function formatPrice($price) {
+    return 'Rp ' . number_format($price, 0, ',', '.');
+}
+
+function shouldEscalate($failedAttempts) {
+    return $failedAttempts >= 3;
+}
+
+function getEscalationResponse() {
+    return [
+        'reply' => "Saya melihat Anda mengalami kesulitan. Untuk memberikan bantuan yang lebih baik, saya akan menghubungkan Anda dengan tim customer service kami.\n\n📱 WhatsApp: +62 812-3456-7890\n📧 Email: info@luxeautoparts.com\n\nKami siap membantu Anda Senin-Minggu, 08.00 - 21.00 WIB.",
+        'quick_replies' => [
+            ['label' => '💬 Hubungi CS', 'action' => 'whatsapp'],
+            ['label' => '📧 Email Kami', 'action' => 'email'],
+            ['label' => '🔙 Kembali', 'action' => 'retry']
+        ],
+        'escalate' => true
+    ];
+}
+
+function getProductCard($product) {
+    $stockStatus = $product['stock'] > 0 ? 'Tersedia' : 'Habis';
+    $stockClass = $product['stock'] > 0 ? 'in-stock' : 'out-of-stock';
+    $imagePath = !empty($product['image']) ? "images/{$product['image']}" : 'images/placeholder.jpg';
+    
+    return [
+        'type' => 'product_card',
+        'id' => $product['id'],
+        'name' => $product['name'],
+        'description' => substr($product['description'], 0, 100) . '...',
+        'price' => formatPrice($product['price']),
+        'price_raw' => $product['price'],
+        'stock' => $product['stock'],
+        'stock_status' => $stockStatus,
+        'stock_class' => $stockClass,
+        'image' => $imagePath
+    ];
+}
+
+function getWelcomeResponse() {
+    return [
+        'reply' => "Halo! Saya asisten virtual LuxeAuto Parts.\n\nSaya siap membantu Anda dengan:\n\n- Informasi produk & harga\n- Keranjang belanja\n- Panduan checkout & pembayaran\n- Pertanyaan umum\n\nAda yang bisa saya bantu hari ini?",
+        'quick_replies' => [
+            ['label' => '🚗 Lihat Produk', 'action' => 'products'],
+            ['label' => '🔍 Cari Produk', 'action' => 'search'],
+            ['label' => '🛒 Keranjang Saya', 'action' => 'cart'],
+            ['label' => '💳 Cara Pembayaran', 'action' => 'payment_info'],
+            ['label' => '📞 Hubungi CS', 'action' => 'contact']
+        ]
+    ];
+}
+
+function processQuickReply($action) {
+    global $pdo;
+    $cartCount = getCartCount();
+    $cartTotal = getCartTotal();
+    
+    switch ($action) {
+        case 'products':
+            return [
+                'reply' => "Silakan browse koleksi lengkap produk kami di halaman Products. Apakah Anda ingin mencari produk tertentu?",
+                'quick_replies' => [
+                    ['label' => '🔍 Cari Produk', 'action' => 'search'],
+                    ['label' => '🏠 Kembali ke Home', 'action' => 'home']
+                ]
+            ];
+            
+        case 'search':
+            return [
+                'reply' => "Ketik nama produk yang Anda cari, contoh: \"oli mesin\" atau \"velg racing\". Saya akan mencarikan untuk Anda!",
+                'quick_replies' => [
+                    ['label' => 'Lihat Semua Produk', 'action' => 'products'],
+                    ['label' => 'Bantuan Lainnya', 'action' => 'help']
+                ]
+            ];
+            
+        case 'cart':
+            if ($cartCount > 0) {
+                return [
+                    'reply' => "Keranjang Anda: {$cartCount} item, total " . formatPrice($cartTotal) . ". Apakah ingin checkout sekarang?",
+                    'quick_replies' => [
+                        ['label' => '🛒 Lihat Keranjang', 'action' => 'view_cart'],
+                        ['label' => '💳 Checkout', 'action' => 'checkout'],
+                        ['label' => '🚗 Lihat Produk', 'action' => 'products']
+                    ]
+                ];
+            }
+            return [
+                'reply' => "Keranjang Anda kosong. Silakan browse produk kami dan tambahkan ke keranjang.",
+                'quick_replies' => [
+                    ['label' => '🚗 Lihat Produk', 'action' => 'products'],
+                    ['label' => '🔍 Cari Produk', 'action' => 'search']
+                ]
+            ];
+            
+        case 'view_cart':
+            return [
+                'reply' => "Anda akan diarahkan ke halaman keranjang.",
+                'quick_replies' => [
+                    ['label' => '💳 Ke Checkout', 'action' => 'checkout']
+                ],
+                'action_redirect' => 'cart.php'
+            ];
+            
+        case 'checkout':
+            if ($cartCount === 0) {
+                return [
+                    'reply' => "Keranjang Anda kosong. Tambahkan produk terlebih dahulu.",
+                    'quick_replies' => [
+                        ['label' => '🚗 Lihat Produk', 'action' => 'products']
+                    ]
+                ];
+            }
+            return [
+                'reply' => "Anda akan diarahkan ke halaman checkout.",
+                'quick_replies' => [
+                    ['label' => '💳 Lanjut Checkout', 'action' => 'checkout_link']
+                ],
+                'action_redirect' => 'checkout.php'
+            ];
+            
+        case 'checkout_link':
+            return [
+                'reply' => "Silakan klik tombol di bawah untuk melanjutkan ke checkout.",
+                'quick_replies' => [],
+                'action_redirect' => 'checkout.php'
+            ];
+            
+        case 'payment_info':
+            return [
+                'reply' => "Metode Pembayaran:\n\n- Transfer Bank (BCA, Mandiri, BNI, BRI)\n- QRIS (scan QR via mobile banking)\n- Kartu Debit/Kredit (Visa, Mastercard)\n- Invoice (untuk perusahaan)\n\nPembayaran diproses otomatis 24 jam.",
+                'quick_replies' => [
+                    ['label' => '💳 Cara QRIS', 'action' => 'qris_help'],
+                    ['label' => '📋 Ke Checkout', 'action' => 'checkout']
+                ]
+            ];
+            
+        case 'qris_help':
+            return [
+                'reply' => "Cara Bayar QRIS:\n\n1. Pilih QRIS saat checkout\n2. Kode QR akan muncul\n3. Buka app banking/e-wallet\n4. Scan dan konfirmasi\n\nProses cepat dan berlaku 24 jam!",
+                'quick_replies' => [
+                    ['label' => '💳 Cara Lainnya', 'action' => 'payment_info'],
+                    ['label' => '📋 Ke Checkout', 'action' => 'checkout']
+                ]
+            ];
+            
+        case 'shipping_info':
+            return [
+                'reply' => "Informasi Pengiriman:\n\n- Gratis ongkir min. Rp 500.000\n- Area: Seluruh Indonesia\n- Estimasi: Jawa 2-4 hari, Luar Jawa 4-7 hari\n- Partner: JNE, J&T, SiCepat\n\nNo. resi dikirim ke email.",
+                'quick_replies' => [
+                    ['label' => '📋 Ke Checkout', 'action' => 'checkout'],
+                    ['label' => '❓ FAQ Lainnya', 'action' => 'faq']
+                ]
+            ];
+            
+        case 'contact':
+            return [
+                'reply' => "Hubungi Kami:\n\nWhatsApp: +62 812-3456-7890\nEmail: info@luxeautoparts.com\n\nJam Operasional: 08.00 - 21.00 WIB",
+                'quick_replies' => [
+                    ['label' => '💬 Hubungi WhatsApp', 'action' => 'whatsapp'],
+                    ['label' => '📧 Kirim Email', 'action' => 'email'],
+                    ['label' => '🏠 Kembali', 'action' => 'home']
+                ]
+            ];
+            
+        case 'whatsapp':
+            return [
+                'reply' => "Klik tombol di bawah untuk menghubungi kami via WhatsApp.",
+                'quick_replies' => [],
+                'action_url' => 'https://wa.me/6281234567890'
+            ];
+            
+        case 'email':
+            return [
+                'reply' => "Kirim email ke info@luxeautoparts.com dengan format:\n\nSubjek: [Nama] - [Pesanan]\nIsi: Pertanyaan Anda\n\nKami akan merespons dalam 1x24 jam.",
+                'quick_replies' => [
+                    ['label' => '💬 Hubungi WhatsApp', 'action' => 'whatsapp'],
+                    ['label' => '🏠 Kembali', 'action' => 'home']
+                ]
+            ];
+            
+        case 'faq':
+            return [
+                'reply' => "FAQ:\n\nQ: Produk bergaransi?\nA: Ya, 1-2 tahun\n\nQ: Bisa return?\nA: Ya, dalam 7 hari\n\nQ: Pengiriman?\nA: 2-7 hari kerja\n\nQ: Ada COD?\nA: Maaf, tidak tersedia",
+                'quick_replies' => [
+                    ['label' => '🚗 Lihat Produk', 'action' => 'products'],
+                    ['label' => '💳 Cara Bayar', 'action' => 'payment_info']
+                ]
+            ];
+            
+        case 'return_refund':
+            return [
+                'reply' => "Kebijakan Pengembalian:\n\n- Maksimal 7 hari setelah terima\n- Produk dalam kondisi semula\n- Sertakan kemasan & nota\n- Garansi 1-2 tahun\n\nHubungi CS untuk proses pengembalian.",
+                'quick_replies' => [
+                    ['label' => '💬 Hubungi CS', 'action' => 'contact'],
+                    ['label' => '❓ FAQ Lainnya', 'action' => 'faq']
+                ]
+            ];
+            
+        case 'retry':
+            return [
+                'reply' => "Silakan coba lagi. Jika masih mengalami masalah, hubungi customer service kami.",
+                'quick_replies' => [
+                    ['label' => '💬 Hubungi CS', 'action' => 'contact'],
+                    ['label' => '🔄 Coba Lagi', 'action' => 'retry']
+                ]
+            ];
+            
+        case 'help':
+        case 'home':
+            return getWelcomeResponse();
+            
+        default:
+            return null;
+    }
+}
+
+function processMessage($message) {
+    global $pdo;
+    $messageLower = strtolower(trim($message));
+    $cartCount = getCartCount();
+    $cartTotal = getCartTotal();
+    
+    // Greeting patterns
+    if (preg_match('/^(halo|hai|helo|hello|hi|hey|pagi|siang|sore|malam)$/', $messageLower)) {
+        return getWelcomeResponse();
+    }
+    
+    // Product search patterns
+    if (preg_match('/^(cari|tampil|lihat|apa|tunjukan|carikan|bantu cari|produk|barang)/', $messageLower)) {
+        $searchTerms = preg_replace('/^(cari|tampil|lihat|apa|tunjukan|carikan|bantu cari|produk|barang)\s*/i', '', $message);
+        $searchTerms = trim($searchTerms);
+        
+        if (!empty($searchTerms) && strlen($searchTerms) > 2) {
+            $products = searchProducts($searchTerms);
+            if (!empty($products)) {
+                $productList = "Hasil pencarian untuk \"{$searchTerms}\":\n\n";
+                foreach ($products as $i => $p) {
+                    $stockBadge = $p['stock'] > 0 ? 'Tersedia' : 'Habis';
+                    $productList .= ($i + 1) . ". {$p['name']} - " . formatPrice($p['price']) . " ({$stockBadge})\n";
+                }
+                return [
+                    'reply' => $productList,
+                    'quick_replies' => array_map(function($p) {
+                        return ['label' => substr($p['name'], 0, 20) . '...', 'action' => 'product_' . $p['id']];
+                    }, array_slice($products, 0, 3))
+                ];
+            }
+            return [
+                'reply' => "Maaf, produk \"{$searchTerms}\" tidak ditemukan. Coba kata kunci lain.",
+                'quick_replies' => [
+                    ['label' => '🚗 Lihat Semua Produk', 'action' => 'products'],
+                    ['label' => '🔍 Cari Lainnya', 'action' => 'search']
+                ]
+            ];
+        }
+        return [
+            'reply' => "Silakan ketik nama produk yang Anda cari.",
+            'quick_replies' => [
+                ['label' => '🚗 Browse Produk', 'action' => 'products'],
+                ['label' => '❓ Bantuan', 'action' => 'help']
+            ]
+        ];
+    }
+    
+    // Price inquiry
+    if (preg_match('/(harga|berapa|biaya|murah|mahal)/', $messageLower)) {
+        $searchTerms = preg_replace('/^(harga|berapa|biaya)\s*/i', '', $message);
+        $searchTerms = trim($searchTerms);
+        
+        if (!empty($searchTerms) && strlen($searchTerms) > 2) {
+            $products = searchProducts($searchTerms, 3);
+            if (!empty($products)) {
+                $priceList = "Informasi Harga:\n\n";
+                foreach ($products as $p) {
+                    $priceList .= "{$p['name']}: " . formatPrice($p['price']) . "\n";
+                }
+                return [
+                    'reply' => $priceList,
+                    'quick_replies' => []
+                ];
+            }
+        }
+        return [
+            'reply' => "Untuk mengetahui harga, ketik nama produk. Contoh: \"harga velg\"",
+            'quick_replies' => [
+                ['label' => '🚗 Lihat Produk', 'action' => 'products']
+            ]
+        ];
+    }
+    
+    // Cart patterns
+    if (preg_match('/(cart|keranjang|troli)/', $messageLower)) {
+        if ($cartCount > 0) {
+            return [
+                'reply' => "Keranjang Anda: {$cartCount} item, total " . formatPrice($cartTotal),
+                'quick_replies' => [
+                    ['label' => '🛒 Lihat Keranjang', 'action' => 'view_cart'],
+                    ['label' => '💳 Checkout', 'action' => 'checkout'],
+                    ['label' => '🚗 Tambah Produk', 'action' => 'products']
+                ]
+            ];
+        }
+        return [
+            'reply' => "Keranjang Anda kosong.",
+            'quick_replies' => [
+                ['label' => '🚗 Lihat Produk', 'action' => 'products'],
+                ['label' => '🔍 Cari Produk', 'action' => 'search']
+            ]
+        ];
+    }
+    
+    // Checkout patterns
+    if (preg_match('/(checkout|bayar|pembayaran|pesanan|order|beli|transaksi)/', $messageLower)) {
+        if ($cartCount === 0) {
+            return [
+                'reply' => "Keranjang Anda kosong. Tambahkan produk terlebih dahulu.",
+                'quick_replies' => [
+                    ['label' => '🚗 Lihat Produk', 'action' => 'products']
+                ]
+            ];
+        }
+        return [
+            'reply' => "Panduan Checkout:\n\n1. Review keranjang\n2. Klik Checkout\n3. Isi data pengiriman\n4. Pilih pembayaran\n5. Pesan Sekarang",
+            'quick_replies' => [
+                ['label' => '📋 Ke Checkout', 'action' => 'checkout'],
+                ['label' => '💳 Metode Bayar', 'action' => 'payment_info']
+            ]
+        ];
+    }
+    
+    // Payment methods
+    if (preg_match('/(bayar|payment|metode|transfer|qris|debit|kredit|invoice)/', $messageLower)) {
+        return [
+            'reply' => "Metode Pembayaran:\n\n- Transfer Bank\n- QRIS\n- Kartu Debit/Kredit\n- Invoice\n\nPembayaran 24/7.",
+            'quick_replies' => [
+                ['label' => '📋 Ke Checkout', 'action' => 'checkout'],
+                ['label' => '📱 Cara QRIS', 'action' => 'qris_help']
+            ]
+        ];
+    }
+    
+    // QRIS specific
+    if (preg_match('/(qris|scan qr|qr code)/', $messageLower)) {
+        return [
+            'reply' => "Cara Bayar QRIS:\n\n1. Pilih QRIS saat checkout\n2. Kode QR muncul\n3. Scan via app banking\n4. Konfirmasi\n\nProses cepat!",
+            'quick_replies' => [
+                ['label' => '📋 Ke Checkout', 'action' => 'checkout'],
+                ['label' => '💳 Cara Lainnya', 'action' => 'payment_info']
+            ]
+        ];
+    }
+    
+    // Shipping patterns
+    if (preg_match('/(kirim|pengiriman|ongkir|ongkos|estimasi|resi|tracking)/', $messageLower)) {
+        return [
+            'reply' => "Informasi Pengiriman:\n\n- Gratis ongkir min. Rp 500.000\n- Estimasi: Jawa 2-4 hari, Luar Jawa 4-7 hari\n- Partner: JNE, J&T, SiCepat\n\nNo. resi ke email.",
+            'quick_replies' => [
+                ['label' => '📋 Ke Checkout', 'action' => 'checkout'],
+                ['label' => '❓ FAQ', 'action' => 'faq']
+            ]
+        ];
+    }
+    
+    // Error troubleshooting patterns
+    if (preg_match('/(gagal|tidak bisa|tidak berhasil|error|masalah|salah|bug|crash)/', $messageLower)) {
+        return [
+            'reply' => "Troubleshooting:\n\n1. Refresh halaman\n2. Cek koneksi internet\n3. Hapus cache browser\n4. Coba browser lain\n5. Pastikan produk tersedia",
+            'quick_replies' => [
+                ['label' => '🔄 Coba Lagi', 'action' => 'retry'],
+                ['label' => '💬 Hubungi CS', 'action' => 'contact']
+            ]
+        ];
+    }
+    
+    // Network errors
+    if (preg_match('/(network|internet|koneksi|offline)/', $messageLower)) {
+        return [
+            'reply' => "Troubleshooting Koneksi:\n\n1. Cek signal WiFi/data\n2. Matikan VPN\n3. Refresh halaman\n4. Hapus cache\n\nPastikan koneksi stabil!",
+            'quick_replies' => [
+                ['label' => '🔄 Coba Lagi', 'action' => 'retry'],
+                ['label' => '💬 Hubungi CS', 'action' => 'contact']
+            ]
+        ];
+    }
+    
+    // Server errors
+    if (preg_match('/(server|500|404|invalid|timeout)/', $messageLower)) {
+        return [
+            'reply' => "Masalah Teknis:\n\n1. Tunggu 1-2 menit\n2. Refresh halaman\n3. Clear cache\n4. Coba perangkat lain\n\nMohon maaf atas ketidaknyamanan.",
+            'quick_replies' => [
+                ['label' => '🔄 Coba Lagi', 'action' => 'retry'],
+                ['label' => '💬 Hubungi CS', 'action' => 'contact']
+            ]
+        ];
+    }
+    
+    // Contact/CS patterns
+    if (preg_match('/(kontak|cs|customer service|whatsapp|telp|telepon|hubungi|email)/', $messageLower)) {
+        return [
+            'reply' => "Hubungi Kami:\n\nWhatsApp: +62 812-3456-7890\nEmail: info@luxeautoparts.com\n\nJam: 08.00 - 21.00 WIB",
+            'quick_replies' => [
+                ['label' => '💬 Hubungi WhatsApp', 'action' => 'whatsapp'],
+                ['label' => '📧 Kirim Email', 'action' => 'email'],
+                ['label' => '🏠 Kembali', 'action' => 'home']
+            ]
+        ];
+    }
+    
+    // FAQ patterns
+    if (preg_match('/(faq|tanya|bantuan|help|bisa|tolong|gimana|bagaimana|cara)/', $messageLower)) {
+        return [
+            'reply' => "Bantuan:\n\n- Cara Pesan: Pilih produk -> Cart -> Checkout\n- Garansi: 1 tahun\n- Return: 7 hari\n- Pengiriman: 2-7 hari",
+            'quick_replies' => [
+                ['label' => '🚗 Cara Pesan', 'action' => 'howto_order'],
+                ['label' => '📦 Pengiriman', 'action' => 'shipping_info'],
+                ['label' => '🔄 Return', 'action' => 'return_refund']
+            ]
+        ];
+    }
+    
+    // Return/Refund patterns
+    if (preg_match('/(return|refund|kembali|garansi|tukar|rusak)/', $messageLower)) {
+        return [
+            'reply' => "Return & Garansi:\n\n- Maksimal 7 hari\n- Produk dalam keadaan semula\n- Sertakan kemasan & nota\n- Garansi 1-2 tahun\n\nHubungi CS untuk proses.",
+            'quick_replies' => [
+                ['label' => '💬 Hubungi CS', 'action' => 'contact'],
+                ['label' => '❓ FAQ Lainnya', 'action' => 'faq']
+            ]
+        ];
+    }
+    
+    // Thank you patterns
+    if (preg_match('/(terima kasih|makasih|thank|suks|senang|good|bagus|oke)/', $messageLower)) {
+        return [
+            'reply' => "Sama-sama! Senang bisa membantu. Selamat berbelanja di LuxeAuto Parts!",
+            'quick_replies' => [
+                ['label' => '🚗 Lihat Produk', 'action' => 'products'],
+                ['label' => '❓ Pertanyaan Lain', 'action' => 'help']
+            ]
+        ];
+    }
+    
+    // Goodbye patterns
+    if (preg_match('/(dadah|byebye|bye|tinggal|salam|see you)/', $messageLower)) {
+        return [
+            'reply' => "Sampai Jumpa! Terima kasih telah mengunjungi LuxeAuto Parts.",
+            'quick_replies' => [
+                ['label' => '🚗 Ke Produk', 'action' => 'products'],
+                ['label' => '🏠 Ke Home', 'action' => 'home']
+            ]
+        ];
+    }
+    
+    // Stock inquiry
+    if (preg_match('/(stok|tersedia|habis|ready|stock|available)/', $messageLower)) {
+        $searchTerms = preg_replace('/^(stok|tersedia|habis|ready|stock)\s*/i', '', $message);
+        $searchTerms = trim($searchTerms);
+        
+        if (!empty($searchTerms) && strlen($searchTerms) > 2) {
+            $products = searchProducts($searchTerms, 3);
+            if (!empty($products)) {
+                $stockList = "Status Stok:\n\n";
+                foreach ($products as $p) {
+                    $status = $p['stock'] > 0 ? "Tersedia ({$p['stock']} unit)" : "Habis";
+                    $stockList .= "{$p['name']}: {$status}\n";
+                }
+                return [
+                    'reply' => $stockList,
+                    'quick_replies' => []
+                ];
+            }
+        }
+        return [
+            'reply' => "Untuk cek stok, ketik nama produk.",
+            'quick_replies' => [
+                ['label' => '🚗 Lihat Produk', 'action' => 'products']
+            ]
+        ];
+    }
+    
+    // Order status
+    if (preg_match('/(order|pesanan|status|konfirmasi)/', $messageLower)) {
+        return [
+            'reply' => "Status Pesanan:\n\n- Pending: Menunggu pembayaran\n- Paid: Sudah dibayar\n- Processing: Diproses\n- Shipped: Dikirim\n- Delivered: Diterima\n\nHubungi CS untuk bantuan.",
+            'quick_replies' => [
+                ['label' => '💬 Hubungi CS', 'action' => 'contact'],
+                ['label' => '❓ FAQ', 'action' => 'faq']
+            ]
+        ];
+    }
+    
+    // General product search fallback
+    $products = searchProducts($message, 3);
+    if (!empty($products)) {
+        $productList = "Mungkin maksud Anda:\n\n";
+        foreach ($products as $i => $p) {
+            $productList .= ($i + 1) . ". {$p['name']} - " . formatPrice($p['price']) . "\n";
+        }
+        return [
+            'reply' => $productList,
+            'quick_replies' => array_map(function($p) {
+                return ['label' => substr($p['name'], 0, 20), 'action' => 'product_' . $p['id']];
+            }, $products)
+        ];
+    }
+    
+    // Default fallback - check escalation
+    global $_SESSION;
+    $_SESSION['chatbot_context']['failed_attempts']++;
+    
+    if (shouldEscalate($_SESSION['chatbot_context']['failed_attempts'])) {
+        return getEscalationResponse();
+    }
+    
+    return [
+        'reply' => "Maaf, saya belum memahami. Saya bisa membantu dengan:\n\n- Informasi produk & harga\n- Keranjang & checkout\n- Metode pembayaran\n- Pengiriman\n- FAQ\n\nSilakan pilih menu di bawah.",
+        'quick_replies' => [
+            ['label' => '🚗 Lihat Produk', 'action' => 'products'],
+            ['label' => '🛒 Keranjang Saya', 'action' => 'cart'],
+            ['label' => '💳 Cara Bayar', 'action' => 'payment_info'],
+            ['label' => '📞 Hubungi CS', 'action' => 'contact']
+        ]
+    ];
+}
+
+// Main request handling
+if ($action === 'product') {
+    $productId = isset($input['product_id']) ? (int)$input['product_id'] : 0;
+    $product = getProduct($productId);
+    
+    if ($product) {
+        $response['reply'] = "**{$product['name']}**\n\n{$product['description']}\n\n";
+        $response['reply'] .= "Harga: " . formatPrice($product['price']) . "\n";
+        $response['reply'] .= "Stok: " . ($product['stock'] > 0 ? "{$product['stock']} unit" : "Maaf, stok habis");
+        
+        $response['product_card'] = getProductCard($product);
+        
+        $quickReplies = [['label' => '🛒 Tambah ke Cart', 'action' => 'add_cart_' . $product['id']]];
+        
+        if ($product['stock'] > 0) {
+            $quickReplies[] = ['label' => '🛒 Beli Sekarang', 'action' => 'buy_now_' . $product['id']];
+        }
+        
+        $quickReplies[] = ['label' => '🚗 Lihat Produk Lain', 'action' => 'products'];
+        
+        $response['quick_replies'] = $quickReplies;
+    } else {
+        $response['reply'] = 'Produk tidak ditemukan.';
+        $response['quick_replies'] = [['label' => '🚗 Lihat Semua Produk', 'action' => 'products']];
+    }
+} elseif ($action === 'quick_reply') {
+    $result = processQuickReply($replyAction);
+    
+    if ($result) {
+        $response['reply'] = $result['reply'];
+        $response['quick_replies'] = $result['quick_replies'];
+        
+        if (isset($result['action_redirect'])) {
+            $response['action_redirect'] = $result['action_redirect'];
+        }
+        
+        if (isset($result['action_url'])) {
+            $response['action_url'] = $result['action_url'];
+        }
+        
+        if (isset($result['escalate'])) {
+            $response['escalate'] = $result['escalate'];
+        }
+    } else {
+        $result = processMessage($replyAction);
+        $response['reply'] = $result['reply'];
+        $response['quick_replies'] = $result['quick_replies'];
+        
+        if (isset($result['escalate'])) {
+            $response['escalate'] = $result['escalate'];
+        }
+    }
+} else {
+    $result = processMessage($message);
+    $response['reply'] = $result['reply'];
+    $response['quick_replies'] = $result['quick_replies'];
+    
+    if (isset($result['escalate'])) {
+        $response['escalate'] = $result['escalate'];
+    }
+}
+
+echo json_encode($response);
+exit;
+</parameter>
